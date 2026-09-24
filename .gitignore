@@ -1,0 +1,9 @@
+# Saved verification results: real email addresses, never commit
+verify_cache.json
+
+# Generated address lists (python email_permutator.py -o emails.txt)
+*.txt
+
+# Python
+__pycache__/
+*.pyc
