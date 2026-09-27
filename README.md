@@ -1,8 +1,12 @@
 # auskiptracer
 
-**Email Permutator**: a command-line tool that builds every likely personal email address from a
-person's name and birth details, then (optionally) checks them with an email
-verification service, most likely address first.
+A command-line skip tracing tool. Give it the full name of the person you're
+tracing and any phone numbers you have. It then builds every likely personal
+email address from their name and birth details and (optionally) checks them
+with an email verification service, most likely address first.
+
+Everything is pinned to a **profile** for that person: name at the top, then
+every phone number and every confirmed email, printed on one page at the end.
 
 Example: from **Jane A. Smith**, nickname **Janie**, born the **7th** in **1990**, it builds
 addresses like `jane.smith90@gmail.com`, `j.a.smith@outlook.com` and
@@ -44,15 +48,32 @@ The script asks one question at a time. Press **Enter** to skip anything optiona
 
 | # | Question | Required | Notes |
 |---|---|---|---|
-| 1 | First name | yes | |
-| 2 | Middle name or initial | no | Type `A` or `Anne` |
-| 3 | Last name | yes | |
-| 4 | Nickname(s) | no | Put commas between several, e.g. `Janie, JJ` |
-| 5 | Birth year | no | 4 digits (`1990`) or 2 (`90`) |
-| 6 | Birth day of month | no | e.g. `7` |
-| 7 | Random numbers | no | `0` = none, `2` = 1–99, `3` = 100–999 (Enter = 0) |
-| 8 | Pattern | no | One known username start, e.g. `j.smith` (see [Pattern](#pattern-mode)) |
-| 9 | Providers | yes | "Search all?" or pick one by one. If random numbers are on, you must pick. |
+| 1 | Who has skipped that needs tracing? | yes | Full name, e.g. `Jane Anne Smith`. The split into first / middle / last is shown so you can correct it. |
+| 2 | Do you have their digits? | no | Phone number(s), see [Phone numbers](#phone-numbers) |
+| 3 | Nickname(s) | no | Put commas between several, e.g. `Janie, JJ` |
+| 4 | Birth year | no | 4 digits (`1990`) or 2 (`90`) |
+| 5 | Birth day of month | no | e.g. `7` |
+| 6 | Random numbers | no | `0` = none, `2` = 1–99, `3` = 100–999 (Enter = 0) |
+| 7 | Pattern | no | One known username start, e.g. `j.smith` (see [Pattern](#pattern-mode)) |
+| 8 | Providers | yes | "Search all?" or pick one by one. If random numbers are on, you must pick. |
+
+If a profile with the same name already exists, it's shown and you're asked
+whether it's the same person. Say **y** to add to it, **n** to open a new one.
+
+### Phone numbers
+
+Type as many as you have, separated by commas or spaces. Spaces inside a
+number are fine too:
+
+| You type | Saved as |
+|---|---|
+| `0412 345 678, 0498765432` | `0412 345 678`, `0498 765 432` |
+| `0412345678 0498765432` | `0412 345 678`, `0498 765 432` |
+| `+61 412 345 678` | `0412 345 678` |
+| `0412 345 678 02 9876 5432` | `0412 345 678`, `02 9876 5432` |
+
+Australian `+61` numbers are stored in the local `0` form so the same number
+is never saved twice. Other international numbers keep their `+`.
 
 For y/n questions, pressing **Enter** on its own means **yes**.
 
@@ -218,11 +239,47 @@ When two addresses are equally likely, providers are checked in this order:
 Gmail, iCloud, Outlook, Hotmail, proton.me, protonmail.com.
 
 A run stops when either:
-- **3 valid addresses** have been found, or
-- **25 paid checks** have been used.
+- **5 valid addresses** have been found, or
+- **50 paid checks** have been used.
 
 Only a `valid` result counts as found. Results like `catch-all` or `unknown`
 are shown but not counted, because the service couldn't confirm them.
+
+Every valid address found is pinned to the person's profile.
+
+---
+
+## The profile board
+
+At the end of every run the whole profile is printed:
+
+```
+========================================
+  JANE ANNE SMITH
+  profile #1, opened 2026-09-27
+========================================
+  |
+  +-- Phone numbers (2)
+  |     +-- 0412 345 678
+  |     `-- 02 9876 5432
+  |
+  `-- Emails (5)
+        +-- jane.smith@gmail.com  (valid, zerobounce)
+        +-- janesmith@gmail.com  (valid, zerobounce)
+        +-- jsmith@icloud.com  (valid, zerobounce)
+        +-- j.smith@icloud.com  (valid, zerobounce)
+        `-- jane.smith@icloud.com  (valid, zerobounce)
+```
+
+To look at a saved profile without running anything:
+
+```powershell
+python email_permutator.py --board "Jane Smith"
+```
+
+Profiles are kept in `profiles.db`, separate from `verify_cache.json`. The
+cache is every address ever checked, for anyone. A profile is one person and
+only what's been confirmed for them.
 
 ### Cost
 
@@ -239,9 +296,10 @@ saved after the first check.
 | `-o FILE`, `--output FILE` | — | Also save the full list to a text file |
 | `--verify` | off | Check the addresses with a verification service |
 | `--provider NAME` | `zerobounce` | Which service your key is for: `zerobounce`, `neverbounce`, `kickbox` or `hunter` |
-| `--max N` | `25` | Maximum paid checks per run |
-| `--stop N` | `3` | Stop after this many valid addresses are found |
+| `--max N` | `50` | Maximum paid checks per run |
+| `--stop N` | `5` | Stop after this many valid addresses are found |
 | `--all` | off | Never stop early; keep checking until `--max` is reached |
+| `--board NAME` | — | Just print the saved profile(s) for that name and exit |
 
 Examples:
 
@@ -269,6 +327,7 @@ python email_permutator.py --verify --provider hunter
 | File | What it is |
 |---|---|
 | `email_permutator.py` | The script |
+| `profiles.db` | Saved profiles: names, phone numbers and confirmed emails (created on the first run). It holds real personal details, so `.gitignore` keeps it out of git. |
 | `verify_cache.json` | Saved verification results (created on the first `--verify` run). Delete it to start fresh. It holds real addresses, so `.gitignore` keeps it out of git. |
 | `.gitignore` | Keeps saved results, generated lists and Python cache files out of git |
 | `README.md` | This file |

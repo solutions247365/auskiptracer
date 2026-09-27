@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Email permutator: builds every likely email address from a person's
-first, middle and last name, nicknames, birth year, birth day and
-(optionally) random numbers, then can verify them most-likely-first.
+Skip tracer: takes the person's full name and any phone numbers you have,
+saves them to a profile, then builds every likely email address from their
+name, nicknames, birth year, birth day and (optionally) random numbers and
+can verify them most-likely-first. Valid addresses are pinned to the
+profile, and the whole profile is printed at the end.
 See README.md for the full details.
 
 Usage:
@@ -11,12 +13,16 @@ Usage:
     python email_permutator.py --verify --provider zerobounce
         # check addresses most-likely-first; API key read from
         # the EMAIL_VERIFY_API_KEY environment variable
+    python email_permutator.py --board "Jane Smith"
+        # just print a saved profile
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -282,7 +288,8 @@ def save_cache(cache):
 
 def verify(emails, provider, key, max_checks, stop_after):
     """Check addresses most-likely-first, stopping once stop_after valid
-    addresses are found (0 = never stop early).
+    addresses are found (0 = never stop early). Returns the valid ones as
+    (email, detail, provider) tuples.
 
     Step 1 looks through every saved result in the cache (free).
     Step 2 only pays for addresses that have never been checked before."""
@@ -302,7 +309,7 @@ def verify(emails, provider, key, max_checks, stop_after):
         verdict, detail = cache[email]["verdict"], cache[email]["detail"]
         print(f"  {verdict.upper():8} {email}  ({detail}, saved)")
         if verdict == "valid":
-            found.append(email)
+            found.append((email, detail, cache[email].get("provider", "")))
             if done():
                 break
 
@@ -327,19 +334,193 @@ def verify(emails, provider, key, max_checks, stop_after):
 
             print(f"  {verdict.upper():8} {email}  ({detail}, checked)")
             if verdict == "valid":
-                found.append(email)
+                found.append((email, detail, provider))
                 if done():
                     break
 
     if done():
         print(f"\nFound {stop_after} valid addresses, stopping.")
     print(f"\n{paid_checks} paid checks used.")
-    if found:
-        print("Valid address(es) found:")
-        for email in found:
-            print(f"  {email}")
-    else:
+    if not found:
         print("No confirmed valid address found in the addresses checked.")
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Phone numbers
+# ---------------------------------------------------------------------------
+
+def normalise_phone(raw):
+    """Digits only, with Australian +61 numbers turned into the local 0 form
+    (+61 412 345 678 -> 0412345678). Other international numbers keep +."""
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("61") and len(digits) == 11:
+        return "0" + digits[2:]
+    if raw.strip().startswith("+"):
+        return "+" + digits
+    return digits
+
+
+def parse_phones(raw):
+    """Split typed phone numbers into a list, no duplicates.
+
+    Numbers can be separated by commas or spaces, and a number can itself
+    have spaces in it (0412 345 678), so short space-separated pieces are
+    joined until they make a full 10-digit number."""
+    phones = []
+    for chunk in re.split(r"[,;/]", raw):
+        current = ""
+        for piece in chunk.split():
+            if not current and len(normalise_phone(piece).lstrip("+")) >= 8:
+                phones.append(normalise_phone(piece))  # a whole number on its own
+                continue
+            current += piece
+            if len(normalise_phone(current).lstrip("+")) >= 10:
+                phones.append(normalise_phone(current))
+                current = ""
+        if normalise_phone(current).lstrip("+"):
+            phones.append(normalise_phone(current))
+    return list(dict.fromkeys(phones))
+
+
+def format_phone(phone):
+    """Space an Australian number the usual way for reading."""
+    if len(phone) == 10 and phone.startswith("04"):
+        return f"{phone[:4]} {phone[4:7]} {phone[7:]}"     # 0412 345 678
+    if len(phone) == 10 and phone.startswith("0"):
+        return f"{phone[:2]} {phone[2:6]} {phone[6:]}"     # 02 9876 5432
+    return phone
+
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+
+# Profiles are kept apart from the email cache: the cache is every address
+# ever checked, a profile is one person and what has been pinned to them.
+PROFILE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.db")
+
+
+def name_key(name):
+    """How names are matched: case, accents and punctuation ignored."""
+    return " ".join(p for p in (clean(w) for w in name.split()) if p)
+
+
+def now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def open_profiles():
+    db = sqlite3.connect(PROFILE_DB)
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS people (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL,
+            created TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS phones (
+            person_id INTEGER NOT NULL REFERENCES people(id),
+            phone TEXT NOT NULL,
+            added TEXT NOT NULL,
+            PRIMARY KEY (person_id, phone)
+        );
+        CREATE TABLE IF NOT EXISTS emails (
+            person_id INTEGER NOT NULL REFERENCES people(id),
+            email TEXT NOT NULL,
+            detail TEXT,
+            provider TEXT,
+            added TEXT NOT NULL,
+            PRIMARY KEY (person_id, email)
+        );
+    """)
+    return db
+
+
+def find_people(db, name):
+    return db.execute("SELECT id, name FROM people WHERE name_key = ? ORDER BY id",
+                      (name_key(name),)).fetchall()
+
+
+def create_person(db, name):
+    with db:
+        return db.execute("INSERT INTO people (name, name_key, created) VALUES (?, ?, ?)",
+                          (name, name_key(name), now())).lastrowid
+
+
+def add_phones(db, person_id, phones):
+    with db:
+        db.executemany("INSERT OR IGNORE INTO phones (person_id, phone, added) VALUES (?, ?, ?)",
+                       [(person_id, p, now()) for p in phones])
+
+
+def add_emails(db, person_id, found):
+    with db:
+        db.executemany("INSERT OR IGNORE INTO emails (person_id, email, detail, provider, added) "
+                       "VALUES (?, ?, ?, ?, ?)",
+                       [(person_id, e, d, p, now()) for e, d, p in found])
+
+
+def print_board(db, person_id):
+    """The whole profile on one page: name at the top, lines out to every
+    phone number and email pinned to them."""
+    name, created = db.execute("SELECT name, created FROM people WHERE id = ?",
+                               (person_id,)).fetchone()
+    phones = db.execute("SELECT phone FROM phones WHERE person_id = ? ORDER BY added, phone",
+                        (person_id,)).fetchall()
+    emails = db.execute("SELECT email, detail, provider FROM emails WHERE person_id = ? "
+                        "ORDER BY added, email", (person_id,)).fetchall()
+
+    def branch(items, last_group):
+        pipe = " " if last_group else "|"
+        if not items:
+            print(f"  {pipe}     `-- (none yet)")
+        for i, item in enumerate(items):
+            print(f"  {pipe}     {'`' if i == len(items) - 1 else '+'}-- {item}")
+
+    width = max(len(name) + 4, 40)
+    print()
+    print("=" * width)
+    print(f"  {name.upper()}")
+    print(f"  profile #{person_id}, opened {created[:10]}")
+    print("=" * width)
+    print("  |")
+    print(f"  +-- Phone numbers ({len(phones)})")
+    branch([format_phone(p) for p, in phones], last_group=False)
+    print("  |")
+    print(f"  `-- Emails ({len(emails)})")
+    branch([f"{e}  ({d}, {p})" if p else e for e, d, p in emails], last_group=True)
+    print()
+
+
+def ask_full_name():
+    """Ask for the person's full name and split it into first, middle and
+    last. Returns (display name, first, middle, last)."""
+    while True:
+        name = " ".join(ask("Who has skipped that needs tracing? ", required=True).split())
+        words = [w for w in (clean(w) for w in name.split()) if w]
+        if len(words) >= 2:
+            break
+        print("  Give their full name, first and last at least.")
+
+    first, last = words[0], words[-1]
+    middle = words[1] if len(words) > 2 else ""
+    print(f"  First: {first}   Middle: {middle or '-'}   Last: {last}")
+    if not ask_yes_no("  Is that split right?"):
+        first = clean(ask("  First name: ", required=True))
+        middle = clean(ask("  Middle name or initial (optional): "))
+        last = clean(ask("  Last name: ", required=True))
+    return name, first, middle, last
+
+
+def pick_profile(db, name):
+    """Reuse a saved profile with the same name, or open a new one."""
+    for person_id, _ in find_people(db, name):
+        print(f"\nThere's already a profile for {name}:")
+        print_board(db, person_id)
+        if ask_yes_no("Is this the same person? Add to this profile?"):
+            return person_id
+    return create_person(db, name)
 
 
 def main():
@@ -349,22 +530,41 @@ def main():
                         help=f"check addresses with a verification API (key in ${API_KEY_ENV})")
     parser.add_argument("--provider", choices=PROVIDERS, default="zerobounce",
                         help="which verification service your API key is for (default: zerobounce)")
-    parser.add_argument("--max", type=int, default=25,
-                        help="maximum paid checks per run (default: 25)")
-    parser.add_argument("--stop", type=int, default=3,
-                        help="stop after this many valid addresses are found (default: 3)")
+    parser.add_argument("--max", type=int, default=50,
+                        help="maximum paid checks per run (default: 50)")
+    parser.add_argument("--stop", type=int, default=5,
+                        help="stop after this many valid addresses are found (default: 5)")
     parser.add_argument("--all", action="store_true",
                         help="never stop early; keep checking up to the --max limit")
+    parser.add_argument("--board", metavar="NAME",
+                        help="just print the saved profile(s) for this name and exit")
     args = parser.parse_args()
+
+    db = open_profiles()
+    if args.board:
+        people = find_people(db, args.board)
+        if not people:
+            sys.exit(f"No profile saved for {args.board}.")
+        for person_id, _ in people:
+            print_board(db, person_id)
+        return
 
     key = os.environ.get(API_KEY_ENV, "").strip()
     if args.verify and not key:
         sys.exit(f"Set your API key first, e.g. in PowerShell:  $env:{API_KEY_ENV} = \"your-key\"")
 
-    print("Email permutator - press Enter to skip optional fields.\n")
-    first = clean(ask("First name: ", required=True))
-    middle = clean(ask("Middle name or initial (optional): "))
-    last = clean(ask("Last name: ", required=True))
+    print("Skip tracer - press Enter to skip optional fields.\n")
+    name, first, middle, last = ask_full_name()
+    person_id = pick_profile(db, name)
+
+    print()
+    phones = parse_phones(ask("Do you have their digits? Phone number(s), "
+                              "separated by commas or spaces (optional): "))
+    if phones:
+        add_phones(db, person_id, phones)
+        print(f"  Saved {len(phones)} number(s): {', '.join(format_phone(p) for p in phones)}")
+
+    print("\nNow the email permutator.\n")
     nicks_raw = ask("Nickname(s), comma separated (optional): ")
     year = clean(ask("Birth year, e.g. 1993 (optional): "))
     day = clean(ask("Birth day of month, e.g. 13 (optional): "))
@@ -407,7 +607,11 @@ def main():
         print(f"Saved to {args.output}")
 
     if args.verify:
-        verify(emails, args.provider, key, args.max, 0 if args.all else args.stop)
+        found = verify(emails, args.provider, key, args.max, 0 if args.all else args.stop)
+        add_emails(db, person_id, found)
+
+    print_board(db, person_id)
+    print(f"Profile saved to {PROFILE_DB}")
 
 
 if __name__ == "__main__":
