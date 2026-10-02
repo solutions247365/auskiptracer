@@ -558,7 +558,7 @@ def main():
     person_id = pick_profile(db, name)
 
     print()
-    phones = parse_phones(ask("Do you have their digits? Phone number(s), "
+    phones = parse_phones(ask("Do you have their Phone number(s), "
                               "separated by commas or spaces (optional): "))
     if phones:
         add_phones(db, person_id, phones)
