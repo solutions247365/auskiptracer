@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import csv
 import datetime
 import json
 import os
@@ -96,14 +97,27 @@ def choose_domains(allow_all=True):
         print("  Pick at least one provider.\n")
 
 
-def number_suffixes(year, day, digits=0):
+def number_suffixes(year, day, digits=0, known_numbers=None):
     """Number endings as (suffix, rank) pairs; a lower rank is more likely.
 
+    If known_numbers is provided, use those instead of random generation.
+    Otherwise:
     YYYY and YY first, then the birth day, then (optionally) random numbers
-    that aren't a date at all: digits=2 adds 1-99, digits=3 adds 100-999
-    only (the 1-99 range is left out to keep the list smaller).
+    that aren't a date at all: digits=1 adds 1-9, digits=2 adds 1-99,
+    digits=3 adds 100-999 only (the 1-99 range is left out to keep the
+    list smaller).
     """
     suffixes = []
+
+    if known_numbers:
+        seen = set()
+        for num in known_numbers:
+            suffix = str(num)
+            if suffix not in seen:
+                seen.add(suffix)
+                suffixes.append((suffix, 0))
+        return suffixes
+
     if len(year) == 4:
         suffixes.append((year, 1))       # 1993
     if year:
@@ -111,13 +125,15 @@ def number_suffixes(year, day, digits=0):
     if day:
         suffixes.append((day.zfill(2), 3))  # 07
         suffixes.append((day, 3))           # 7
-    if digits == 2:
+    if digits == 1:
+        suffixes += [(str(n), 4) for n in range(1, 10)]
+    elif digits == 2:
         suffixes += [(str(n), 4) for n in range(1, 100)]
     elif digits == 3:
         suffixes += [(str(n), 4) for n in range(100, 1000)]
 
     ranked = {}
-    for suffix, rank in suffixes:  # dedupe, keeping the first (most likely) rank
+    for suffix, rank in suffixes:
         ranked.setdefault(suffix, rank)
     return list(ranked.items())
 
@@ -186,11 +202,11 @@ def pattern_parts(pattern, suffixes):
 
 
 def build_emails(first, last, nicknames, year, day, domains=DOMAINS, digits=0,
-                 pattern="", middle=""):
+                 pattern="", middle="", known_numbers=None):
     """Return a list of (email, score) in generation order, no duplicates.
     If pattern is given, only that username start is used instead of every
-    name combination."""
-    suffixes = number_suffixes(year, day, digits)
+    name combination. If known_numbers is given, use those instead of random."""
+    suffixes = number_suffixes(year, day, digits, known_numbers)
     if pattern:
         parts = pattern_parts(pattern, suffixes)
     else:
@@ -289,10 +305,8 @@ def save_cache(cache):
 def verify(emails, provider, key, max_checks, stop_after):
     """Check addresses most-likely-first, stopping once stop_after valid
     addresses are found (0 = never stop early). Returns the valid ones as
-    (email, detail, provider) tuples.
-
-    Step 1 looks through every saved result in the cache (free).
-    Step 2 only pays for addresses that have never been checked before."""
+    (email, detail, provider) tuples, the order checked, and a status map.
+    """
     check = PROVIDERS[provider]
     cache = load_cache()
     ordered = [e for e, _ in sorted(emails, key=lambda e: (e[1], DOMAIN_ORDER[e[0].split("@")[1]]))]
@@ -301,6 +315,8 @@ def verify(emails, provider, key, max_checks, stop_after):
         return stop_after and len(found) >= stop_after
 
     found, paid_checks = [], 0
+    checked_order = []
+    checked_results = {}
 
     # Step 1: saved results, no credits used
     cached = [e for e in ordered if e in cache]
@@ -308,6 +324,8 @@ def verify(emails, provider, key, max_checks, stop_after):
     for email in cached:
         verdict, detail = cache[email]["verdict"], cache[email]["detail"]
         print(f"  {verdict.upper():8} {email}  ({detail}, saved)")
+        checked_order.append(email)
+        checked_results[email] = (verdict, detail, cache[email].get("provider", ""))
         if verdict == "valid":
             found.append((email, detail, cache[email].get("provider", "")))
             if done():
@@ -333,6 +351,8 @@ def verify(emails, provider, key, max_checks, stop_after):
             time.sleep(0.2)  # stay well under provider rate limits
 
             print(f"  {verdict.upper():8} {email}  ({detail}, checked)")
+            checked_order.append(email)
+            checked_results[email] = (verdict, detail, provider)
             if verdict == "valid":
                 found.append((email, detail, provider))
                 if done():
@@ -343,7 +363,43 @@ def verify(emails, provider, key, max_checks, stop_after):
     print(f"\n{paid_checks} paid checks used.")
     if not found:
         print("No confirmed valid address found in the addresses checked.")
-    return found
+    return found, checked_order, checked_results
+
+
+def save_emails_csv(filename, emails, checked_results=None, checked_order=None):
+    """Save all emails to a CSV file.
+
+    If verification data is supplied, verified emails are listed first in the
+    order they were checked, followed by every other checked email in the same
+    test order. If no verification occurred, emails are saved in generation order."""
+    rows = []
+
+    if checked_results and checked_order:
+        valid_first = []
+        remaining = []
+        seen = set()
+        for email in checked_order:
+            if email in seen:
+                continue
+            seen.add(email)
+            if email in checked_results:
+                verdict, detail, provider = checked_results[email]
+                if verdict == "valid":
+                    valid_first.append([email, verdict, detail, provider])
+                else:
+                    remaining.append([email, verdict, detail, provider])
+            else:
+                remaining.append([email, "unchecked", "", ""])
+
+        rows = valid_first + remaining
+    else:
+        for email, _ in emails:
+            rows.append([email, "unchecked", "", ""])
+
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Email", "Status", "Detail", "Provider"])
+        writer.writerows(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +579,17 @@ def pick_profile(db, name):
     return create_person(db, name)
 
 
+def parse_known_numbers(raw):
+    """Parse a comma-separated list of numbers into integers, ignoring blanks."""
+    if not raw.strip():
+        return None
+    try:
+        return [int(n.strip()) for n in raw.split(",") if n.strip()]
+    except ValueError:
+        print("  Please enter numbers separated by commas (e.g. 42, 123, 7)")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate email address permutations.")
     parser.add_argument("-o", "--output", help="also write the list to this file")
@@ -577,13 +644,24 @@ def main():
 
     print()
     print("Random numbers after the name (not a date)?")
-    print("  0 = none   2 = two digits, 1-99   3 = three digits, 100-999 only")
+    print("  0 = none   1 = one digit, 1-9   2 = two digits, 1-99   3 = three digits, 100-999 only")
     while True:
-        digits = ask("Choose 0, 2 or 3 (Enter = 0): ") or "0"
-        if digits in ("0", "2", "3"):
+        digits = ask("Choose 0, 1, 2 or 3 (Enter = 0): ") or "0"
+        if digits in ("0", "1", "2", "3"):
             digits = int(digits)
             break
-        print("  Please type 0, 2 or 3.")
+        print("  Please type 0, 1, 2 or 3.")
+
+    known_numbers = None
+    if digits > 0:
+        print()
+        if ask_yes_no("Do you know what those numbers are?"):
+            while True:
+                known_raw = ask("Enter the numbers, comma-separated (e.g. 42, 123, 7): ")
+                known_numbers = parse_known_numbers(known_raw)
+                if known_numbers is not None:
+                    print(f"  Will use: {', '.join(str(n) for n in known_numbers)}")
+                    break
 
     print()
     print("Only want one username pattern? Type the part before the number,")
@@ -593,7 +671,7 @@ def main():
     # Random numbers multiply the list, so make the user choose providers.
     domains = choose_domains(allow_all=not digits)
 
-    emails = build_emails(first, last, nicknames, year, day, domains, digits, pattern, middle)
+    emails = build_emails(first, last, nicknames, year, day, domains, digits, pattern, middle, known_numbers)
 
     print()
     if not args.verify:
@@ -606,9 +684,15 @@ def main():
             f.write("\n".join(email for email, _ in emails) + "\n")
         print(f"Saved to {args.output}")
 
+    # Always save a CSV of all generated addresses.
+    csv_filename = f"{name.replace(' ', '_')}_emails.csv"
+    checked_results = None
+    checked_order = None
     if args.verify:
-        found = verify(emails, args.provider, key, args.max, 0 if args.all else args.stop)
+        found, checked_order, checked_results = verify(emails, args.provider, key, args.max, 0 if args.all else args.stop)
         add_emails(db, person_id, found)
+    save_emails_csv(csv_filename, emails, checked_results, checked_order)
+    print(f"All emails saved to {csv_filename}")
 
     print_board(db, person_id)
     print(f"Profile saved to {PROFILE_DB}")
